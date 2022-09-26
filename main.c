@@ -3,9 +3,10 @@
  */
 
 #include <stdio.h>
-#pragma push_macro("")
+//#pragma push_macro("")
 #include <windows.h>
-#pragma pop_macro("")
+//#pragma pop_macro("")
+#include <stdint.h>
 #include "main.h"
 
 // variable ensuring game is constantly running even without a message sent
@@ -13,7 +14,12 @@ BOOL gGameIsRunning;
 // window handle
 HWND gWindowHandle;
 // drawing surface
-GAMEBITMAP gDrawingSurface;
+GAMEBITMAP gBackBuffer;
+// monitor info particularly important for full-screen mode
+MONITORINFO gMonitorInfo = {sizeof(MONITORINFO)};
+// monitor information
+int32_t gMonitorWidth;
+int32_t gMonitorHeight;
 
 /* window main function */
 INT WINAPI WinMain(HINSTANCE Instance, HINSTANCE PrevInstance, PSTR CommandLine, INT CmdShow) {
@@ -36,18 +42,18 @@ INT WINAPI WinMain(HINSTANCE Instance, HINSTANCE PrevInstance, PSTR CommandLine,
     }
 
     /* Drawing surface specifications */
-    gDrawingSurface.BitMapInfo.bmiHeader.biSize = sizeof(gDrawingSurface.BitMapInfo.bmiHeader);
-    gDrawingSurface.BitMapInfo.bmiHeader.biWidth = RES_WIDTH;
-    gDrawingSurface.BitMapInfo.bmiHeader.biHeight = RES_HEIGHT;
-    gDrawingSurface.BitMapInfo.bmiHeader.biBitCount = BPP;
-    gDrawingSurface.BitMapInfo.bmiHeader.biCompression = BI_RGB;
-    gDrawingSurface.BitMapInfo.bmiHeader.biPlanes = 1;
-    gDrawingSurface.Memory = VirtualAlloc(NULL, DRAWING_AREA_MEMSIZE,
-                                          MEM_RESERVE | MEM_COMMIT,
-                                          PAGE_READWRITE);
+    gBackBuffer.BitMapInfo.bmiHeader.biSize = sizeof(gBackBuffer.BitMapInfo.bmiHeader);
+    gBackBuffer.BitMapInfo.bmiHeader.biWidth = RES_WIDTH;
+    gBackBuffer.BitMapInfo.bmiHeader.biHeight = RES_HEIGHT;
+    gBackBuffer.BitMapInfo.bmiHeader.biBitCount = BPP;
+    gBackBuffer.BitMapInfo.bmiHeader.biCompression = BI_RGB;
+    gBackBuffer.BitMapInfo.bmiHeader.biPlanes = 1;
+    gBackBuffer.Memory = VirtualAlloc(NULL, DRAWING_AREA_MEMSIZE,
+                                      MEM_RESERVE | MEM_COMMIT,
+                                      PAGE_READWRITE);
     // assertion that memory allocation doesn't fail
-    if (gDrawingSurface.Memory == NULL) {
-        MessageBoxA(NULL, "Failed to allocation drawing surface's memory",
+    if (gBackBuffer.Memory == NULL) {
+        MessageBoxA(NULL, "Failed to allocate memory for drawing surface!",
                     "Error!", MB_ICONEXCLAMATION | MB_OK);
         goto Exit;
     }
@@ -139,8 +145,12 @@ DWORD CreateMainWindowA() {
     WindowClass.hIconSm       = LoadIconA(NULL, IDI_APPLICATION);
     WindowClass.hCursor       = LoadCursorA(NULL, IDC_ARROW);
     WindowClass.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    WindowClass.hbrBackground = CreateSolidBrush(RGB(255,0,255));
     WindowClass.lpszMenuName  = NULL;
     WindowClass.lpszClassName = GAME_NAME "_WINDOWCLASS";
+
+    // DPI awareness (regardless of zoom level)
+    SetProcessDPIAware();
 
     if (!RegisterClassExA(&WindowClass)) {
         Result = GetLastError();
@@ -151,7 +161,7 @@ DWORD CreateMainWindowA() {
 
     /* create the window */
     gWindowHandle = CreateWindowExA(
-            WS_EX_CLIENTEDGE,
+            0,
             WindowClass.lpszClassName,      // window class name
             WINDOW_TITLE,                  // window title
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,   // window style
@@ -168,6 +178,33 @@ DWORD CreateMainWindowA() {
         goto Exit;
     }
 
+    // after creating window, we may later resize that window, and store into MONITORINFO struct
+    if (GetMonitorInfoA(MonitorFromWindow(gWindowHandle,
+                        MONITOR_DEFAULTTOPRIMARY), &gMonitorInfo) == 0) {
+        Result = ERROR_MCA_MONITOR_VIOLATES_MCCS_SPECIFICATION;
+        goto Exit;
+    }
+
+    // full-screen styling
+    if (SetWindowLongPtrA(gWindowHandle, GWL_STYLE,
+                          // window style: keeping VISIBLE but remove OVERLAPPEDWINDOW attributes
+                          (WS_OVERLAPPEDWINDOW|WS_VISIBLE)&~WS_OVERLAPPEDWINDOW)==0) {
+        Result = GetLastError();
+        goto Exit;
+    }
+
+    // monitor information
+    gMonitorWidth = gMonitorInfo.rcMonitor.right - gMonitorInfo.rcMonitor.left;
+    gMonitorHeight = gMonitorInfo.rcMonitor.bottom - gMonitorInfo.rcMonitor.top;
+
+    // full-screen position
+    if (SetWindowPos(gWindowHandle, HWND_TOP,
+                     gMonitorInfo.rcMonitor.left, gMonitorInfo.rcMonitor.top,
+                     gMonitorWidth, gMonitorHeight, SWP_FRAMECHANGED) == 0) {
+        Result = GetLastError();
+        goto Exit;
+    }
+
 Exit:
     return Result;
 }
@@ -178,15 +215,13 @@ BOOL AlreadyRunning(void) {
     // creating a mutex (serialization allowing 1 thing at a time)
     Mutex = CreateMutexA(NULL, FALSE, GAME_NAME "_Mutex");
     // now we check if the mutex is already held, then there must be another window opened
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        return TRUE;
-    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return TRUE;
     return FALSE;
 }
 
 /* player's input processing */
 void ProcessPlayerInput(void) {
-    SHORT EscIsDown = GetAsyncKeyState(VK_ESCAPE);
+    int16_t EscIsDown = GetAsyncKeyState(VK_ESCAPE);
     // send the window a message
     if (EscIsDown) {
         SendMessageW(gWindowHandle, WM_CLOSE, 0, 0);
@@ -195,5 +230,23 @@ void ProcessPlayerInput(void) {
 
 /* rendering frame graphics of window */
 void RenderFrameGraphics(void) {
+    // drawing on back buffer
+    PIXEL32 Pixel = {0};
+    Pixel.Blue = 0x7f;
+    Pixel.Green = 0;
+    Pixel.Red = 0;
+    Pixel.Alpha = 0xff;
+    for (uint32_t i=0; i < RES_WIDTH*RES_HEIGHT; i++) {
+        memcpy_s((PIXEL32*) gBackBuffer.Memory + i, sizeof(PIXEL32),
+                 &Pixel, sizeof(PIXEL32));
+    }
 
+    HDC DeviceContext = GetDC(gWindowHandle);
+    // drawing on window Device-Independently (for stretching)
+    StretchDIBits(DeviceContext, 0, 0,
+                  gMonitorWidth, gMonitorHeight,
+                  0, 0, RES_WIDTH, RES_HEIGHT,
+                  gBackBuffer.Memory, &gBackBuffer.BitMapInfo,
+                  DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(gWindowHandle, DeviceContext);
 }
